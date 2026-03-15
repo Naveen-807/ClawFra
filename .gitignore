@@ -1,0 +1,38 @@
+# Env and secrets — never commit
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local DB / state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+data/*.json
+
+# Logs and OS
+.DS_Store
+*.log
+npm-debug.log*
+
+# Planning docs and guides (contain API keys, wallet addresses, internal notes)
+SETUP_STATUS.md
+NEXT_STEPS.md
+CLAWBOT_AUTONOMOUS_EXECUTION_GUIDE.md
+CLAWBOT_BEGINNER_BUILD_GUIDE.md
+CLAWFRA_IMPLEMENTATION_PLAN.md
+HACKATHON_FULL_RUNBOOK.md
+Plans/
+
+# Third-party cloned repos
+x402/
+
+# Claude config
+.claude/
