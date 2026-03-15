@@ -50,7 +50,8 @@ export async function fundWallet(
     value: ethers.parseEther(amount),
   });
   const receipt = await tx.wait();
-  return receipt!.hash;
+  if (!receipt) throw new Error("Transaction was dropped or replaced");
+  return receipt.hash;
 }
 
 export async function sendTx(
@@ -65,9 +66,10 @@ export async function sendTx(
     value: ethers.parseEther(amount),
   });
   const receipt = await tx.wait();
+  if (!receipt) throw new Error("Transaction was dropped or replaced");
   return {
-    txHash: receipt!.hash,
-    explorerUrl: `${EXPLORER}/tx/${receipt!.hash}`,
+    txHash: receipt.hash,
+    explorerUrl: `${EXPLORER}/tx/${receipt.hash}`,
   };
 }
 
@@ -82,4 +84,9 @@ export async function sendAgentFee(
 
 export function explorerAddressUrl(address: string): string {
   return `${EXPLORER}/address/${address}`;
+}
+
+export async function getBalance(address: string): Promise<string> {
+  const balance = await provider.getBalance(address);
+  return ethers.formatEther(balance);
 }

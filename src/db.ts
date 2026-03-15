@@ -155,6 +155,12 @@ const stmtCreateTx = db.prepare(`
 const stmtGetLastTx = db.prepare(
   "SELECT * FROM transactions WHERE subAgentId = ? ORDER BY id DESC LIMIT 1"
 );
+const stmtGetTx = db.prepare(
+  "SELECT * FROM transactions WHERE id = ? AND subAgentId = ?"
+);
+const stmtUpdateTxStatus = db.prepare(
+  "UPDATE transactions SET status = ?, txHash = ?, agentFeeTxHash = ? WHERE id = ?"
+);
 
 export function createTransaction(
   subAgentId: number,
@@ -178,9 +184,46 @@ export function createTransaction(
   ) as Transaction;
 }
 
+export function getTransaction(
+  txId: number,
+  subAgentId: number
+): Transaction | undefined {
+  return stmtGetTx.get(txId, subAgentId) as Transaction | undefined;
+}
+
+export function updateTransactionStatus(
+  txId: number,
+  status: string,
+  txHash: string | null = null,
+  agentFeeTxHash: string | null = null
+): void {
+  stmtUpdateTxStatus.run(status, txHash, agentFeeTxHash, txId);
+}
+
 export function getLastTransaction(
   subAgentId: number
 ): Transaction | undefined {
   return stmtGetLastTx.get(subAgentId) as Transaction | undefined;
+}
+
+export function removeApprovedRecipient(
+  subAgentId: number,
+  address: string
+): string[] {
+  const policy = getOrCreatePolicy(subAgentId);
+  const lower = address.toLowerCase();
+  policy.approvedRecipients = policy.approvedRecipients.filter(
+    (r) => r !== lower
+  );
+  stmtUpdateRecipients.run(
+    JSON.stringify(policy.approvedRecipients),
+    subAgentId
+  );
+  return policy.approvedRecipients;
+}
+
+export function getWalletBalance(encryptedKey: string): string {
+  // balance checking is async — handled by wallet.ts, not DB
+  return encryptedKey;
 }
 

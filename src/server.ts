@@ -6,8 +6,12 @@ import {
   createSubAgent,
   getOrCreatePolicy,
   setMaxTxAmount,
+  setAutoApproveAmount,
   addApprovedRecipient,
+  removeApprovedRecipient,
   createTransaction,
+  getTransaction,
+  updateTransactionStatus,
   getLastTransaction,
 } from "./db.js";
 import {
@@ -17,6 +21,7 @@ import {
   sendTx,
   sendAgentFee,
   explorerAddressUrl,
+  getBalance,
 } from "./wallet.js";
 import { evaluateTransaction } from "./policy.js";
 
@@ -26,6 +31,13 @@ app.use(express.json());
 const AGENT_8004_ID = "#202";
 const AGENT_8004_LINK = "https://www.8004scan.io/";
 const EXPLORER = "https://explorer.testnet3.goat.network";
+
+// Helper: resolve user + sub-agent from telegramUserId
+function resolveAgent(telegramUserId: string) {
+  const user = getOrCreateUser(String(telegramUserId));
+  const subAgent = getSubAgent(user.id);
+  return { user, subAgent };
+}
 
 // --- POST /start ---
 app.post("/start", async (req, res) => {
@@ -38,21 +50,21 @@ app.post("/start", async (req, res) => {
     const user = getOrCreateUser(String(telegramUserId), username);
     let subAgent = getSubAgent(user.id);
     let isNew = false;
+    let fundingStatus = "skipped";
 
     if (!subAgent) {
       isNew = true;
       const wallet = createWallet();
       const encryptedKey = encrypt(wallet.privateKey);
       subAgent = createSubAgent(user.id, wallet.address, encryptedKey);
-
-      // Create default policy
       getOrCreatePolicy(subAgent.id);
 
-      // Fund wallet from treasury
       try {
         await fundWallet(wallet.address);
+        fundingStatus = "funded";
       } catch (e: any) {
         console.error("Failed to fund wallet:", e.message);
+        fundingStatus = `failed: ${e.message}`;
       }
     }
 
@@ -77,6 +89,7 @@ app.post("/start", async (req, res) => {
         note: "This wallet is registered as an on-chain agent identity",
       },
       isNew,
+      ...(isNew ? { fundingStatus } : {}),
     });
   } catch (e: any) {
     console.error("/start error:", e);
@@ -94,8 +107,7 @@ app.post("/policy", async (req, res) => {
         .json({ error: "telegramUserId, action required" });
     }
 
-    const user = getOrCreateUser(String(telegramUserId));
-    const subAgent = getSubAgent(user.id);
+    const { subAgent } = resolveAgent(telegramUserId);
     if (!subAgent) {
       return res
         .status(404)
@@ -124,7 +136,12 @@ app.post("/policy", async (req, res) => {
       if (isNaN(amount) || amount <= 0) {
         return res.status(400).json({ error: "Invalid amount" });
       }
-      const { setAutoApproveAmount } = await import("./db.js");
+      const currentPolicy = getOrCreatePolicy(subAgent.id);
+      if (amount > currentPolicy.maxTxAmount) {
+        return res.status(400).json({
+          error: `Auto-approve amount (${amount}) cannot exceed max transaction amount (${currentPolicy.maxTxAmount})`,
+        });
+      }
       setAutoApproveAmount(subAgent.id, amount);
       const policy = getOrCreatePolicy(subAgent.id);
       return res.json({
@@ -148,7 +165,20 @@ app.post("/policy", async (req, res) => {
       });
     }
 
-    return res.status(400).json({ error: "Unknown action. Use: setMax, setAutoApprove, allow" });
+    if (action === "remove") {
+      if (!value || !value.startsWith("0x")) {
+        return res.status(400).json({ error: "Invalid address" });
+      }
+      const recipients = removeApprovedRecipient(subAgent.id, value);
+      return res.json({
+        message: `Address ${value} removed from approved recipients`,
+        approvedRecipients: recipients,
+      });
+    }
+
+    return res.status(400).json({
+      error: "Unknown action. Use: setMax, setAutoApprove, allow, remove",
+    });
   } catch (e: any) {
     console.error("/policy error:", e);
     res.status(500).json({ error: e.message });
@@ -159,22 +189,25 @@ app.post("/policy", async (req, res) => {
 app.post("/pay", async (req, res) => {
   try {
     const { telegramUserId, amount, recipientAddress } = req.body;
-    if (!telegramUserId || !amount || !recipientAddress) {
+    if (!telegramUserId || amount === undefined || !recipientAddress) {
       return res
         .status(400)
         .json({ error: "telegramUserId, amount, recipientAddress required" });
     }
 
-    const user = getOrCreateUser(String(telegramUserId));
-    const subAgent = getSubAgent(user.id);
+    const { subAgent } = resolveAgent(telegramUserId);
     if (!subAgent) {
       return res
         .status(404)
         .json({ error: "No agent found. Send /start first." });
     }
 
+    const numAmount = parseFloat(String(amount));
+    if (isNaN(numAmount) || numAmount <= 0) {
+      return res.status(400).json({ error: "Invalid amount. Must be a positive number." });
+    }
+
     const policy = getOrCreatePolicy(subAgent.id);
-    const numAmount = parseFloat(amount);
     const evaluation = evaluateTransaction(policy, recipientAddress, numAmount);
 
     // DENY
@@ -196,7 +229,7 @@ app.post("/pay", async (req, res) => {
 
     // ASK APPROVAL
     if (evaluation.decision === "ask_approval") {
-      createTransaction(
+      const tx = createTransaction(
         subAgent.id,
         recipientAddress,
         numAmount,
@@ -208,6 +241,8 @@ app.post("/pay", async (req, res) => {
         allowed: false,
         decision: "ask_approval",
         reason: evaluation.reason,
+        pendingTxId: tx.id,
+        hint: "Use /approve with this transaction ID to execute the payment",
       });
     }
 
@@ -215,14 +250,30 @@ app.post("/pay", async (req, res) => {
     let userTx: { txHash: string; explorerUrl: string };
     let feeTx: { txHash: string; explorerUrl: string } | null = null;
 
-    // 1. User payment
-    userTx = await sendTx(
-      subAgent.encryptedPrivateKey,
-      recipientAddress,
-      String(numAmount)
-    );
+    try {
+      userTx = await sendTx(
+        subAgent.encryptedPrivateKey,
+        recipientAddress,
+        numAmount.toFixed(18)
+      );
+    } catch (e: any) {
+      // Log the failed attempt
+      createTransaction(
+        subAgent.id,
+        recipientAddress,
+        numAmount,
+        "allow",
+        evaluation.reason,
+        "failed"
+      );
+      return res.status(500).json({
+        allowed: true,
+        decision: "allow",
+        reason: evaluation.reason,
+        error: `Transaction failed: ${e.message}`,
+      });
+    }
 
-    // 2. Agent fee (x402)
     try {
       feeTx = await sendAgentFee(subAgent.encryptedPrivateKey);
     } catch (e: any) {
@@ -262,6 +313,137 @@ app.post("/pay", async (req, res) => {
   }
 });
 
+// --- POST /approve ---
+app.post("/approve", async (req, res) => {
+  try {
+    const { telegramUserId, txId } = req.body;
+    if (!telegramUserId || !txId) {
+      return res.status(400).json({ error: "telegramUserId, txId required" });
+    }
+
+    const { subAgent } = resolveAgent(telegramUserId);
+    if (!subAgent) {
+      return res
+        .status(404)
+        .json({ error: "No agent found. Send /start first." });
+    }
+
+    const pendingTx = getTransaction(Number(txId), subAgent.id);
+    if (!pendingTx) {
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+    if (pendingTx.status !== "pending_approval") {
+      return res
+        .status(400)
+        .json({ error: `Transaction is ${pendingTx.status}, not pending_approval` });
+    }
+
+    let userTx: { txHash: string; explorerUrl: string };
+    let feeTx: { txHash: string; explorerUrl: string } | null = null;
+
+    try {
+      userTx = await sendTx(
+        subAgent.encryptedPrivateKey,
+        pendingTx.recipient,
+        pendingTx.amount.toFixed(18)
+      );
+    } catch (e: any) {
+      updateTransactionStatus(pendingTx.id, "failed");
+      return res.status(500).json({ error: `Transaction failed: ${e.message}` });
+    }
+
+    try {
+      feeTx = await sendAgentFee(subAgent.encryptedPrivateKey);
+    } catch (e: any) {
+      console.error("Agent fee tx failed (continuing):", e.message);
+    }
+
+    updateTransactionStatus(
+      pendingTx.id,
+      "completed",
+      userTx.txHash,
+      feeTx?.txHash ?? null
+    );
+
+    res.json({
+      message: "Transaction approved and executed",
+      txId: pendingTx.id,
+      userPayment: {
+        txHash: userTx.txHash,
+        explorer: userTx.explorerUrl,
+      },
+      agentFee: feeTx
+        ? {
+            txHash: feeTx.txHash,
+            explorer: feeTx.explorerUrl,
+            note: "x402 agent fee — the agent charged for this action",
+          }
+        : { note: "Agent fee tx failed — see logs" },
+    });
+  } catch (e: any) {
+    console.error("/approve error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- POST /balance ---
+app.post("/balance", async (req, res) => {
+  try {
+    const { telegramUserId } = req.body;
+    if (!telegramUserId) {
+      return res.status(400).json({ error: "telegramUserId required" });
+    }
+
+    const { subAgent } = resolveAgent(telegramUserId);
+    if (!subAgent) {
+      return res
+        .status(404)
+        .json({ error: "No agent found. Send /start first." });
+    }
+
+    const balance = await getBalance(subAgent.walletAddress);
+
+    res.json({
+      walletAddress: subAgent.walletAddress,
+      balance: `${balance} GOAT`,
+      walletExplorer: explorerAddressUrl(subAgent.walletAddress),
+    });
+  } catch (e: any) {
+    console.error("/balance error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- POST /fund ---
+app.post("/fund", async (req, res) => {
+  try {
+    const { telegramUserId, amount } = req.body;
+    if (!telegramUserId) {
+      return res.status(400).json({ error: "telegramUserId required" });
+    }
+
+    const { subAgent } = resolveAgent(telegramUserId);
+    if (!subAgent) {
+      return res
+        .status(404)
+        .json({ error: "No agent found. Send /start first." });
+    }
+
+    const fundAmount = amount ? String(amount) : "0.0002";
+    const txHash = await fundWallet(subAgent.walletAddress, fundAmount);
+
+    res.json({
+      message: `Funded ${fundAmount} GOAT to agent wallet`,
+      walletAddress: subAgent.walletAddress,
+      txHash,
+      explorer: `${EXPLORER}/tx/${txHash}`,
+    });
+  } catch (e: any) {
+    console.error("/fund error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // --- POST /status ---
 app.post("/status", async (req, res) => {
   try {
@@ -270,8 +452,7 @@ app.post("/status", async (req, res) => {
       return res.status(400).json({ error: "telegramUserId required" });
     }
 
-    const user = getOrCreateUser(String(telegramUserId));
-    const subAgent = getSubAgent(user.id);
+    const { subAgent } = resolveAgent(telegramUserId);
     if (!subAgent) {
       return res
         .status(404)
@@ -281,10 +462,18 @@ app.post("/status", async (req, res) => {
     const policy = getOrCreatePolicy(subAgent.id);
     const lastTx = getLastTransaction(subAgent.id);
 
+    let balance: string | null = null;
+    try {
+      balance = await getBalance(subAgent.walletAddress);
+    } catch (e: any) {
+      console.error("Balance check failed:", e.message);
+    }
+
     res.json({
       subAgentId: subAgent.id,
       walletAddress: subAgent.walletAddress,
       walletExplorer: explorerAddressUrl(subAgent.walletAddress),
+      balance: balance ? `${balance} GOAT` : "unavailable",
       policy: {
         maxTxAmount: policy.maxTxAmount,
         autoApproveAmount: policy.autoApproveAmount,
@@ -292,9 +481,11 @@ app.post("/status", async (req, res) => {
       },
       lastTransaction: lastTx
         ? {
+            id: lastTx.id,
             amount: lastTx.amount,
             recipient: lastTx.recipient,
             decision: lastTx.decision,
+            status: lastTx.status,
             txHash: lastTx.txHash,
             explorer: lastTx.txHash
               ? `${EXPLORER}/tx/${lastTx.txHash}`
@@ -324,5 +515,7 @@ const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {
   console.log(`ClawFra API running on port ${PORT}`);
   console.log(`ERC-8004 Agent ID: ${AGENT_8004_ID}`);
-  console.log(`Endpoints: POST /start, /policy, /pay, /status`);
+  console.log(
+    `Endpoints: POST /start, /policy, /pay, /approve, /balance, /fund, /status`
+  );
 });
